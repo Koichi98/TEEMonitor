@@ -13,10 +13,13 @@
 #include <linux/module.h>
 #include <linux/kthread.h>
 #include <linux/poll.h>
+#include <linux/file.h>
 #include <linux/tee_drv.h>
 #include <linux/tee.h>
+#include <linux/seccomp.h>
 #include "tee_client_api_extensions.h"
 #include "tee_client_api.h"
+#include "seccomp.h"
 //#include "teec_trace.h"
 
 
@@ -32,7 +35,8 @@ static long device_ioctl(struct file *, unsigned int, unsigned long);
 #define DEVICE_NAME "teemonitordev" /* Dev name as it appears in /proc/devices */
 #define BUF_LEN 80 /* Max length of the message from the device */
 #define SET_SESSION 3
-#define INVOKE 4
+#define SET_NOTIFYFD 4
+#define INVOKE 5
 #define TA_HELLO_WORLD_CMD_INC_VALUE 0
 
 /* Global variables are declared as static, so are global within the file. */
@@ -52,6 +56,7 @@ static char msg[BUF_LEN + 1]; /* The msg the device will give when asked */
 //static struct task_struct *k;
 
 static TEEC_Session session;
+static int notifyfd;
 
 static struct class *cls;
 
@@ -92,11 +97,50 @@ static int __init teemonitordev_init(void)
  unregister_chrdev(major, DEVICE_NAME);
  }
 
- /* Methods */
 
- /* Called when a process tries to open the device file, like
- * "sudo cat /dev/chardev"
- */
+
+
+static int notification(void *arg){
+
+	struct fd f; 
+   struct seccomp_notif *req;
+   //struct seccomp_notif_resp *resp;
+   struct seccomp_filter *filter;
+   long rc;
+
+   f = fdget(notifyfd);
+	if(!f.file){
+		printk(KERN_INFO "notifyfd: Bad file number \n");
+      return -1;
+	}
+   memset(&req, 0, sizeof(req));
+   filter = f.file->private_data;
+   rc = seccomp_notify_recv_original(filter, req);
+	if (rc) {
+		printk(KERN_INFO "SECCOMP_IOCTL_NOTIF_RECV: error\n");
+      return -1;
+	}
+   printk("nr:%d\n",req->data.nr);
+
+   //invoke_command(NULL);
+
+   //resp->id = req->id;
+   //resp->id = req->id;
+   //resp->flags = 0;
+   
+   //if(req->data->nr){
+   // resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+   //}else{
+   //resp->error = -EPERM;
+   //}
+
+   //if(vfs_ioctl(f.file, SECCOMP_IOCTL_NOTIF_SEND, resp)==-1){
+      //printk(KERN_INFO "SECCOMP_IOCTL_NOTIF_SEND: error\n")
+   //}
+
+   return 0;
+
+}
 
 static int invoke_command(void *arg)
 {
@@ -212,14 +256,19 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
    case SET_SESSION:
       printk("SET_Session\n");
       printk("session from kernel:%ld\n",arg);
-      //if (copy_from_user(&session, (void __user *)arg, sizeof(session))) {
-            //return -EFAULT;
-      //}
-      memcpy(&session,arg,sizeof(session));
+      if(copy_from_user(&session,(TEEC_Session*)arg,sizeof(session))){
+            return -EFAULT;
+      }
       
       break;
+   case SET_NOTIFYFD:
+      if(copy_from_user(&notifyfd,(int*)arg,sizeof(notifyfd))){
+            return -EFAULT;
+      }
+      break;
    case INVOKE:
-      invoke_command(NULL);
+      printk("INVOKE\n");
+      notification(NULL);
       break;
    default:
       printk(KERN_WARNING "unsupported command %d\n", cmd);

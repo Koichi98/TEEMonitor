@@ -53,6 +53,9 @@
 #include <linux/ioctl.h>
 #include <linux/file.h>
 #include <linux/syscalls.h>
+#include <linux/kprobes.h>
+//#include <drivers/tee/optee/optee_private.h>
+//#include "optee_private.h"
 #include "tee_client_api_extensions.h"
 #include "tee_client_api.h"
 //#include <teec_trace.h>
@@ -63,6 +66,22 @@
 #endif
 #include <linux/tee.h>
 
+//extern int optee_invoke_func(struct tee_context *ctx, struct tee_ioctl_invoke_arg *arg,
+		      //struct tee_param *param);
+
+unsigned long lookup_optee_invoke_func(void) {
+    struct kprobe kp;
+    unsigned long addr;
+    
+    memset(&kp, 0, sizeof(struct kprobe));
+    kp.symbol_name = "optee_invoke_func";
+    if (register_kprobe(&kp) < 0) {
+        return 0;
+    }
+    addr = (unsigned long)kp.addr;
+    unregister_kprobe(&kp);
+    return addr;
+}
 ////#include "teec_benchmark.h"
 
 ///* How many device sequence numbers will be tried before giving up */
@@ -79,7 +98,7 @@
 //#define SHM_FLAG_BUFFER_ALLOCED		(1u << 0)
 //#define SHM_FLAG_SHADOW_BUFFER_ALLOCED	(1u << 1)
 
-struct mutex teec_mutex; //= PTHREAD_MUTEX_INITIALIZER;
+struct mutex teec_mutex; //= PTHREAD_MUTEX_INITIALIZER5
 
 //static void teec_mutex_lock(pthread_mutex_t *mu)
 //{
@@ -347,7 +366,7 @@ static TEEC_Result teec_pre_process_operation(TEEC_Context *ctx,
 			struct tee_ioctl_param *params,
 			TEEC_SharedMemory *shms)
 {
-	TEEC_Result res = TEEC_ERROR_GENERIC;
+	//TEEC_Result res = TEEC_ERROR_GENERIC;
 	size_t n = 0;
 
 	memset(shms, 0, sizeof(TEEC_SharedMemory) *
@@ -690,6 +709,97 @@ static void teec_post_process_operation(TEEC_Operation *operation,
 		////EMSG("Failed to close session 0x%x", session->session_id);
 //}
 
+
+// params_from_user():/drivers/tee/tee_core.c
+static int ioctl_params_to_params(struct tee_context *ctx, struct tee_param *params,
+			    size_t num_params,
+			    struct tee_ioctl_param *ip)
+{
+	size_t n;
+
+	//struct tee_ioctl_param *uparams_plus_n;
+	for (n = 0; n < num_params; n++) {
+		//struct tee_shm *shm;
+		//struct tee_ioctl_param ip;
+		//uparams_plus_n = uparams + n;
+		//memcpy(&ip,uparams_plus_n,sizeof(ip));
+
+		/* All unused attribute bits has to be zero */
+		if (ip->attr & ~TEE_IOCTL_PARAM_ATTR_MASK){
+			printk(KERN_INFO "ioctl_params_to_params: All unused attribute bits has to be zero");
+			return -EINVAL;
+		}
+
+		params[n].attr = ip->attr;
+		switch (ip->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK) {
+		case TEE_IOCTL_PARAM_ATTR_TYPE_NONE:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
+			params[n].u.value.a = ip->a;
+			params[n].u.value.b = ip->b;
+			params[n].u.value.c = ip->c;
+			break;
+		default:
+			printk(KERN_INFO "ioctl_params_to_params:Unknown attribute");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+int tee_ioctl_invoke_original(struct tee_context *ctx, struct tee_ioctl_buf_data *buf)
+{
+	//int rc;
+	//size_t n;
+	struct tee_ioctl_invoke_arg arg;
+	struct tee_param *params = NULL;
+	int (*optee_invoke_func)(struct tee_context*, struct tee_ioctl_invoke_arg*, struct tee_param*);
+
+	if (buf->buf_len > TEE_MAX_ARG_SIZE ||
+	    buf->buf_len < sizeof(struct tee_ioctl_invoke_arg)){
+		printk(KERN_INFO "error: buf.buf_len size is wrong");
+		return -EINVAL;
+    }
+
+	memcpy(&arg,(struct tee_ioctl_invoke_arg*)buf->buf_ptr,sizeof(arg));
+	if (arg.num_params) {
+		params = kcalloc(arg.num_params, sizeof(struct tee_param),
+				 GFP_KERNEL); //GFP_KERNEL 0
+		if (!params){
+			printk(KERN_INFO "kcalloc: tee_ioctl_invoke_original()");
+			return -1;
+		}
+		ioctl_params_to_params(ctx, params,arg.num_params,arg.params);
+	}
+
+	printk(KERN_INFO "before optee_invoke_func()");
+	optee_invoke_func = (int (*)(struct tee_context *, struct tee_ioctl_invoke_arg *, struct tee_param *))lookup_optee_invoke_func();
+
+	if(optee_invoke_func(ctx,&arg,params)<0){
+		printk(KERN_INFO "optee_invoke_func() failed");
+	}
+	printk(KERN_INFO "after optee_invoke_func()");
+
+	return 0;
+}
+
+long tee_ioctl_original(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct tee_context *ctx = filp->private_data;
+
+	switch (cmd){
+	case TEE_IOC_INVOKE:
+		return tee_ioctl_invoke_original(ctx, (struct tee_ioctl_buf_data*)arg);
+	default:
+		return -1;
+	}
+
+}
+
+
 TEEC_Result TEEC_InvokeCommand(TEEC_Session *session, uint32_t cmd_id,
 			TEEC_Operation *operation, uint32_t *error_origin)
 {
@@ -707,6 +817,7 @@ TEEC_Result TEEC_InvokeCommand(TEEC_Session *session, uint32_t cmd_id,
 	} buf;
 	struct tee_ioctl_buf_data buf_data;
 	TEEC_SharedMemory shm[TEEC_CONFIG_PAYLOAD_REF_COUNT];
+	struct fd f;
 
 	memset(&buf, 0, sizeof(buf));
 	memset(&buf_data, 0, sizeof(buf_data));
@@ -744,16 +855,11 @@ TEEC_Result TEEC_InvokeCommand(TEEC_Session *session, uint32_t cmd_id,
 		eorig = TEEC_ORIGIN_API;
 		goto out; //_free_temp_refs;
 	}
-	printk(KERN_INFO "session fd%d\n",session->ctx->fd);
-	printk(KERN_INFO "before fdget");
-	struct fd f = fdget(session->ctx->fd);
-	printk(KERN_INFO "after fdget");
+	f = fdget(session->ctx->fd);
 	if(!f.file){
 		printk(KERN_INFO "Bad file number\n");
 	}
-	printk(KERN_INFO "before vfs_ioctl");
-	rc = vfs_ioctl(f.file, TEE_IOC_INVOKE, &buf_data);
-	printk(KERN_INFO "vfs_ioctl completed");
+	rc = tee_ioctl_original(f.file, TEE_IOC_INVOKE, (unsigned long)&buf_data);
 	if (rc) {
 		//EMSG("TEE_IOC_INVOKE failed");
 		eorig = TEEC_ORIGIN_COMMS;
